@@ -113,16 +113,41 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicATAState, IPOD_CLASSIC_ATA)
 #define S5L8702_ATA_CFG_WRITE          (1u << 4)
 
 /*
- * INFERRED: bit 0 of ATA_IRQ is the device's INTRQ, gated by ATA_IRQMASK.
- * Nothing states the bit layout. Rockbox never reads ATA_IRQ, and Apple only
- * ever writes it back to itself ("ATA_IRQ = ATA_IRQ" at 0x08325f14), which
- * establishes that it is write-one-to-clear and nothing else. Both drivers
- * poll ATA_PIO_CSD rather than waiting for an interrupt -- 0x08325dec reads
- * the alternate status and then the status and tests ERR, DRQ and DF by hand
- * -- so an interrupt that never arrives costs nothing, and one that arrives
- * with the wrong bit set would be acknowledged and ignored.
+ * ATA_IRQ, write-one-to-clear and gated by ATA_IRQMASK.
+ *
+ * This used to say "INFERRED: bit 0 is the device's INTRQ", on the grounds
+ * that both drivers poll ATA_PIO_CSD and so "an interrupt that never arrives
+ * costs nothing". That holds for Rockbox and for Apple's 1.1.2. It does NOT
+ * hold for 2.0.5, and the cost was MEASURED (ATATRACE=2): after every
+ * non-data command Apple's driver writes
+ *
+ *     ATA_PIO_CSD  = 0xef          SET FEATURES
+ *     ATA_IRQ_MASK = 0x04          <- bit 2, and only bit 2
+ *
+ * and sleeps until the interrupt or about 7.7 s, whichever is first. With the
+ * INTRQ reported on bit 0 alone it was always the 7.7 s. It issues three SET
+ * FEATURES when it brings the disk back up, so anything not already in RAM --
+ * the first song, "previous track", a seek out of the cached range -- took
+ * 23 s to start:
+ *
+ *     t=60079ms WR +0x70 = 0xef   t=67788ms RD +0x70      (7709 ms)
+ *     t=67789ms WR +0x70 = 0xef   t=75488ms RD +0x70      (7699 ms)
+ *     t=75488ms WR +0x70 = 0xef   t=83199ms RD +0x70      (7711 ms)
+ *
+ * Bit 2 as the device interrupt is also what Samsung documents for this
+ * controller's siblings (S3C6410 ATA_IRQ: 0 XFER_DONE, 1 UDMA_HOLD,
+ * 2 ATADEV_IRQ, 3 TBUF_FULL, 4 SBUF_EMPTY), and it agrees with Rockbox, whose
+ * DMA path unmasks bit 0 and waits for the TRANSFER to finish.
+ *
+ * The IDE core gives us one line for both events, so both bits are raised from
+ * it: bit 2 because the device interrupted, bit 0 because for a DMA command
+ * that is also the moment the transfer is over, which is the behaviour every
+ * earlier measurement was taken with.
  */
-#define S5L8702_ATA_INTRQ_BIT    (1u << 0)
+#define S5L8702_ATA_IRQ_XFER_DONE  (1u << 0)
+#define S5L8702_ATA_IRQ_ATADEV     (1u << 2)
+#define S5L8702_ATA_INTRQ_BIT    (S5L8702_ATA_IRQ_XFER_DONE | \
+                                  S5L8702_ATA_IRQ_ATADEV)
 
 struct IPodClassicATAState {
     SysBusDevice parent_obj;

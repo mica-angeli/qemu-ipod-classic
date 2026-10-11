@@ -49,6 +49,22 @@ static bool ata_trace(void)
     return on;
 }
 
+/*
+ * ATATRACE=2 stamps each line with the virtual time. The order of the accesses
+ * says what the guest's protocol is; the gaps between them say where it is
+ * WAITING, which is the question when a track takes 23 s to start.
+ */
+static bool ata_trace_stamp(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("ATATRACE");
+        on = e && atoi(e) >= 2;
+    }
+    return on;
+}
+
 static void ipod_classic_ata_update_irq(IPodClassicATAState *s)
 {
     uint32_t active = s->reg[S5L8702_ATA_IRQSTAT / 4] &
@@ -311,6 +327,10 @@ static uint64_t ipod_classic_ata_read(void *opaque, hwaddr offset,
     IPodClassicATAState *s = opaque;
 
     if (ata_trace() && offset != S5L8702_ATA_PIO_READY) {
+        if (ata_trace_stamp()) {
+            fprintf(stderr, "t=%" PRId64 "ms ",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+        }
         fprintf(stderr, "ATA RD +0x%02x\n", (unsigned)offset);
     }
     switch (offset) {
@@ -384,6 +404,10 @@ static void ipod_classic_ata_write(void *opaque, hwaddr offset,
     IPodClassicATAState *s = opaque;
 
     if (ata_trace()) {
+        if (ata_trace_stamp()) {
+            fprintf(stderr, "t=%" PRId64 "ms ",
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+        }
         fprintf(stderr, "ATA WR +0x%02x = 0x%08x\n", (unsigned)offset,
                 (unsigned)value);
     }
