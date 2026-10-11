@@ -1125,6 +1125,122 @@ static unsigned hle_mp3_frame(const uint8_t *d, unsigned *spf, unsigned *rate,
     return (ver == 3 ? 144 : 72) * br / *rate + pad;
 }
 
+/*
+ * AAC in an MP4 container. The guest hands the engine raw AAC frames exactly as
+ * it does MPEG ones (MEASURED on 2.0.5: 517 hand-overs for a 12 s clip, 43 a
+ * second, at offsets 3416, 3837, 4154 ... -- the file's own sample table from
+ * its second entry on), so the frame index here is that table: stsz gives each
+ * frame's size, stco/co64 and stsc where the chunks are and how many frames
+ * each holds. An AAC-LC frame is 1024 samples.
+ */
+static uint32_t hle_be32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+/* The first child box of type `fourcc` in [off, end): its payload. */
+static bool hle_mp4_box(const uint8_t *d, size_t off, size_t end,
+                        const char *fourcc, size_t *start, size_t *stop)
+{
+    while (off + 8 <= end) {
+        uint64_t sz = hle_be32(d + off);
+        size_t hdr = 8;
+
+        if (sz == 1) {
+            if (off + 16 > end) {
+                return false;
+            }
+            sz = (uint64_t)hle_be32(d + off + 8) << 32 | hle_be32(d + off + 12);
+            hdr = 16;
+        } else if (sz == 0) {
+            sz = end - off;
+        }
+        if (sz < hdr || sz > end - off) {
+            return false;
+        }
+        if (!memcmp(d + off + 4, fourcc, 4)) {
+            *start = off + hdr;
+            *stop = off + (size_t)sz;
+            return true;
+        }
+        off += (size_t)sz;
+    }
+    return false;
+}
+
+static bool hle_mp4_index(HLEStream *st, size_t size)
+{
+    const uint8_t *d = st->data;
+    size_t ms, me, ts, te, a, b, sa, sb;
+
+    if (!hle_mp4_box(d, 0, size, "moov", &ms, &me)) {
+        return false;
+    }
+    /* Each track in turn, until one is AAC audio. */
+    for (size_t at = ms; hle_mp4_box(d, at, me, "trak", &ts, &te); at = te) {
+        size_t zs, ze, cs, ce, os, oe, ds, de;
+        uint32_t nsamp, fixed, nstsc, nchunk, s = 0;
+        bool co64 = false;
+
+        if (!hle_mp4_box(d, ts, te, "mdia", &a, &b) ||
+            !hle_mp4_box(d, a, b, "minf", &a, &b) ||
+            !hle_mp4_box(d, a, b, "stbl", &sa, &sb) ||
+            !hle_mp4_box(d, sa, sb, "stsd", &ds, &de) || de - ds < 44 ||
+            memcmp(d + ds + 12, "mp4a", 4) ||
+            !hle_mp4_box(d, sa, sb, "stsz", &zs, &ze) || ze - zs < 12 ||
+            !hle_mp4_box(d, sa, sb, "stsc", &cs, &ce) || ce - cs < 8) {
+            continue;
+        }
+        if (!hle_mp4_box(d, sa, sb, "stco", &os, &oe)) {
+            if (!hle_mp4_box(d, sa, sb, "co64", &os, &oe)) {
+                continue;
+            }
+            co64 = true;
+        }
+        if (oe - os < 8) {
+            continue;
+        }
+        fixed = hle_be32(d + zs + 4);
+        nsamp = hle_be32(d + zs + 8);
+        nstsc = hle_be32(d + cs + 4);
+        nchunk = hle_be32(d + os + 4);
+        if ((!fixed && (ze - zs - 12) / 4 < nsamp) ||
+            (ce - cs - 8) / 12 < nstsc ||
+            (oe - os - 8) / (co64 ? 8 : 4) < nchunk || !nsamp || !nstsc) {
+            continue;
+        }
+
+        st->frame_off = g_new(uint32_t, nsamp);
+        for (uint32_t c = 0, e = 0; c < nchunk && s < nsamp; c++) {
+            const uint8_t *o = d + os + 8 + (size_t)c * (co64 ? 8 : 4);
+            uint64_t pos = co64 ? (uint64_t)hle_be32(o) << 32 | hle_be32(o + 4)
+                                : hle_be32(o);
+            uint32_t per;
+
+            /* stsc entries are runs: (first chunk, frames per chunk, ...). */
+            while (e + 1 < nstsc &&
+                   hle_be32(d + cs + 8 + (size_t)(e + 1) * 12) <= c + 1) {
+                e++;
+            }
+            per = hle_be32(d + cs + 8 + (size_t)e * 12 + 4);
+            for (uint32_t i = 0; i < per && s < nsamp; i++, s++) {
+                st->frame_off[s] = (uint32_t)pos;
+                pos += fixed ? fixed : hle_be32(d + zs + 12 + (size_t)s * 4);
+            }
+        }
+        st->nframes = s;
+        st->spf = 1024;
+        st->channels = d[ds + 32] << 8 | d[ds + 33];
+        st->rate = hle_be32(d + ds + 40) >> 16;
+        st->info_frame = false;
+        if (st->channels < 1 || st->channels > 2) {
+            st->channels = 2;
+        }
+        return s > 0;
+    }
+    return false;
+}
+
 static bool hle_stream_load(int k)
 {
     HLEStream *st = &hle_streams[k];
@@ -1148,7 +1264,13 @@ static bool hle_stream_load(int k)
     }
     close(fd);
 
-    /* Past an ID3v2 tag, then frame by frame. Not MP3: no index, and the
+    /* MP4 first: an mdat is full of things that look like MPEG headers. */
+    if (t->size > 12 && !memcmp(st->data + 4, "ftyp", 4)) {
+        hle_mp4_index(st, t->size);
+        return true;
+    }
+
+    /* Past an ID3v2 tag, then frame by frame. Neither: no index, and the
      * callers fall back to the byte offset. */
     if (t->size > 10 && !memcmp(st->data, "ID3", 3)) {
         o = 10 + ((st->data[6] & 0x7f) << 21 | (st->data[7] & 0x7f) << 14 |
@@ -1307,10 +1429,12 @@ void ipod_classic_hle_audio_note_stream(const uint8_t *head, size_t len)
  *
  * Returns the bytes written; 0 when the frame is known but its track is still
  * being decoded (the caller may wait a moment); -1 when it is not a frame of
- * any file on the disk.
+ * any file on the disk. *samples is the frame's size in 16-bit samples
+ * whenever the answer is not -1.
  */
 int ipod_classic_hle_audio_frame_pcm(const uint8_t *head, size_t len,
-                                     uint8_t *dst, size_t max)
+                                     uint8_t *dst, size_t max,
+                                     unsigned *samples)
 {
     HLEStream *st;
     size_t off, bytes, at, n = 0;
@@ -1321,18 +1445,20 @@ int ipod_classic_hle_audio_frame_pcm(const uint8_t *head, size_t len,
         !hle_stream_find(head, len, &k, &off)) {
         return -1;
     }
-    frame = hle_stream_frame(k, off);
     st = &hle_streams[k];
+    if (!st->nframes) {
+        return -1;                      /* a file, but not one we can index */
+    }
+    *samples = st->spf * st->channels;
+    bytes = MIN(max, (size_t)*samples * 2);
+    frame = hle_stream_frame(k, off);
     if (frame < 0) {
         /* The info frame, or not on a frame boundary: silence is right for
          * the first and the honest answer for the second. */
-        bytes = MIN(max, (size_t)(st->spf ? st->spf : 1152) *
-                         (st->channels ? st->channels : 2) * 2);
         memset(dst, 0, bytes);
         return (int)bytes;
     }
-    bytes = MIN(max, (size_t)st->spf * st->channels * 2);
-    at = (size_t)frame * st->spf * st->channels * 2;
+    at = (size_t)frame * *samples * 2;
 
     qemu_mutex_lock(&hle.lock);
     if (k != hle.chosen || !qatomic_read(&hle.pcm_ready)) {

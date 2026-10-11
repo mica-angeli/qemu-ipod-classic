@@ -93,9 +93,11 @@ void ipod_classic_hle_audio_set_native(bool on);
 /*
  * The decoded PCM of the frame whose first bytes are `head`. Bytes written;
  * 0 if that track is still being decoded; -1 if it is not a known frame.
+ * *samples is the frame's size in 16-bit samples unless the answer is -1.
  */
 int ipod_classic_hle_audio_frame_pcm(const uint8_t *head, size_t len,
-                                     uint8_t *dst, size_t max);
+                                     uint8_t *dst, size_t max,
+                                     unsigned *samples);
 
 /*
  * True when the shim is enabled and actively feeding decoded PCM (a song has

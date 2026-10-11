@@ -569,7 +569,7 @@ static void sm1_sync_submit(const uint8_t *head)
 /* Deliver one owed frame if the guest has taken the last. True if it did. */
 static bool sm1_sync_complete(void)
 {
-    uint8_t pcm[1152 * 4];
+    uint8_t pcm[2048 * 4];              /* room for an SBR frame */
     unsigned samples = sm1_sync_frames * sm1_sync_channels;
     uint16_t h;
 
@@ -589,12 +589,24 @@ static bool sm1_sync_complete(void)
      */
     memset(pcm, 0, sizeof(pcm));
     if (sm1_decode_on()) {
+        /*
+         * The host knows the file, so it knows the frame's size better than
+         * the header guess in sm1_sync_submit(): an AAC frame is 1024 samples
+         * and does not start with anything recognisable.
+         */
+        unsigned known = samples;
         int n = ipod_classic_hle_audio_frame_pcm(sm1_sync_head,
                                                  sizeof(sm1_sync_head),
-                                                 pcm, samples * 2);
+                                                 pcm, sizeof(pcm), &known);
         if (n == 0 && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - sm1_sync_since
                       < SM1_SYNC_DECODE_WAIT_NS) {
             return false;               /* track still decoding: a moment more */
+        }
+        if (n >= 0 && known * 2 <= sizeof(pcm)) {
+            samples = known;
+        }
+        if (n <= 0) {
+            memset(pcm, 0, sizeof(pcm));
         }
     }
 
