@@ -127,6 +127,7 @@ typedef struct {
 typedef struct {
     bool        enabled;
     bool        trace;
+    bool        trace_disk;         /* HLE_AUDIO_TRACE=2: log every disk read  */
     ARMCPU     *cpu;
     PL080State *dmac0;
     IPodClassicI2SState *i2s;    /* for tx_samples (boot-vs-play gate)         */
@@ -176,6 +177,14 @@ typedef struct {
 } HLEAudioState;
 
 static HLEAudioState hle;
+
+/*
+ * Decode for the engine rather than for the host feed: the file's own rate
+ * and channels, frame-aligned. Set once by the SM1 model before any track is
+ * decoded (SM1_SYNC + SM1_DECODE).
+ */
+static bool hle_native;
+void ipod_classic_hle_audio_set_native(bool on) { hle_native = on; }
 
 static bool hle_env_on(const char *name)
 {
@@ -523,9 +532,24 @@ static uint8_t *hle_decode_track(int k, size_t *out_used)
     close(tfd);
 
     /* Decode to raw s16le stereo 44100 on stdout. */
-    snprintf(cmd, sizeof(cmd),
-             "ffmpeg -v error -i '%s' -f s16le -ar 44100 -ac 2 - 2>/dev/null",
-             tmp);
+    if (hle_native) {
+        /*
+         * For the engine (ipod_classic_hle_audio_frame_pcm): the decoder's
+         * own output, in the file's own rate and channel count, with nothing
+         * trimmed. skip_manual stops ffmpeg dropping the encoder/decoder
+         * priming samples, so audio frame N is exactly samples
+         * [N * spf, (N + 1) * spf) -- MEASURED on a LAME file of 9355 frames:
+         * 10775808 samples = 9354 * 1152, against 10773924 by default (1105
+         * trimmed). The firmware trims the priming itself.
+         */
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -v error -flags2 +skip_manual -i '%s' -f s16le - "
+                 "2>/dev/null", tmp);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -v error -i '%s' -f s16le -ar 44100 -ac 2 - "
+                 "2>/dev/null", tmp);
+    }
     pp = popen(cmd, "r");
     if (!pp) {
         fprintf(stderr, "HLE_AUDIO: popen(ffmpeg) failed\n");
@@ -660,6 +684,26 @@ void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len)
 {
     if (!hle.enabled || !qatomic_read(&hle.scan_done)) {
         return;
+    }
+    /*
+     * HLE_AUDIO_TRACE=2: every guest disk read, with the virtual time and the
+     * file it falls in. "Is the guest reading, and how fast" is the first
+     * question whenever a track is slow to start.
+     */
+    if (hle.trace_disk) {
+        int in = -1;
+        for (int k = 0; k < hle.ntracks; k++) {
+            if (byte_off + len > hle.tracks[k].file_off &&
+                byte_off < hle.tracks[k].file_off + hle.tracks[k].size) {
+                in = k;
+                break;
+            }
+        }
+        fprintf(stderr, "HLE_AUDIO: disk read t=%" PRId64 "ms off=%llu len=%u "
+                "file=%d (+%lld)\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                (unsigned long long)byte_off, len, in,
+                in >= 0 ? (long long)(byte_off - hle.tracks[in].file_off) : 0LL);
     }
     if (qatomic_read(&hle.pcm_ready) || hle.chosen >= 0 || hle.stream_seen) {
         return;
@@ -1031,83 +1075,277 @@ void ipod_classic_hle_audio_commit(uint32_t moved)
 }
 
 /*
- * The guest handed its audio engine a buffer of compressed stream. Find those
- * bytes on the disk: that names the file being played and the position in it,
- * exactly, where the disk-read heuristic above can only guess (and guesses
- * wrong whenever a readahead straddles two files). Follow it: a different file
- * is a track change, a distant position in the same file is a seek or a
- * restart.
+ * THE STREAM INDEX.
  *
- * The position is turned into PCM by proportion, which is exact for constant
- * bitrate and close for anything else; the guest's own elapsed-time display
- * does not come from here, so the error is inaudible rather than visible.
+ * What the guest hands its audio engine is compressed stream straight out of
+ * a file, one MPEG audio frame at a time (MEASURED on 2.0.5: successive
+ * hand-overs 313, 522, 835, 626 bytes apart in a VBR file, each starting on a
+ * frame header). Finding those bytes on the disk names the file and the
+ * frame, exactly -- where the disk-read heuristic above can only guess, and
+ * guesses wrong whenever a readahead straddles two files.
+ *
+ * The frame number matters as much as the file: a position worked out from
+ * the byte offset alone is only right for constant bitrate.
+ */
+typedef struct {
+    uint8_t  *data;         /* the file's bytes, read once */
+    uint32_t *frame_off;    /* where each MPEG audio frame starts */
+    unsigned  nframes;
+    unsigned  spf;          /* samples per frame: 1152, or 576 for MPEG-2/2.5 */
+    unsigned  rate;
+    unsigned  channels;
+    bool      info_frame;   /* frame 0 is a Xing/Info header, not audio */
+} HLEStream;
+
+static HLEStream hle_streams[HLE_MAX_TRACKS];
+
+/* MPEG audio Layer III frame header at d[0..3]: its length, 0 if not one. */
+static unsigned hle_mp3_frame(const uint8_t *d, unsigned *spf, unsigned *rate,
+                              unsigned *channels)
+{
+    static const uint16_t br1[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+                                      160, 192, 224, 256, 320, 0 };
+    static const uint16_t br2[16] = { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80,
+                                      96, 112, 128, 144, 160, 0 };
+    static const uint32_t sr[4][3] = { { 11025, 12000, 8000 }, { 0, 0, 0 },
+                                       { 22050, 24000, 16000 },
+                                       { 44100, 48000, 32000 } };
+    unsigned ver = (d[1] >> 3) & 3, layer = (d[1] >> 1) & 3;
+    unsigned bri = d[2] >> 4, sri = (d[2] >> 2) & 3, pad = (d[2] >> 1) & 1;
+    unsigned br;
+
+    if (d[0] != 0xff || (d[1] & 0xe0) != 0xe0 || ver == 1 || layer != 1 ||
+        bri == 0 || bri == 15 || sri == 3) {
+        return 0;
+    }
+    br = (ver == 3 ? br1[bri] : br2[bri]) * 1000;
+    *spf = (ver == 3) ? 1152 : 576;
+    *rate = sr[ver][sri];
+    *channels = ((d[3] >> 6) & 3) == 3 ? 1 : 2;
+    return (ver == 3 ? 144 : 72) * br / *rate + pad;
+}
+
+static bool hle_stream_load(int k)
+{
+    HLEStream *st = &hle_streams[k];
+    HLETrack *t = &hle.tracks[k];
+    size_t o = 0, cap = 0;
+    int fd;
+
+    if (st->data) {
+        return true;
+    }
+    fd = open(hle.disk_path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    st->data = g_malloc(t->size);
+    if (pread(fd, st->data, t->size, t->file_off) != (ssize_t)t->size) {
+        g_free(st->data);
+        st->data = NULL;
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    /* Past an ID3v2 tag, then frame by frame. Not MP3: no index, and the
+     * callers fall back to the byte offset. */
+    if (t->size > 10 && !memcmp(st->data, "ID3", 3)) {
+        o = 10 + ((st->data[6] & 0x7f) << 21 | (st->data[7] & 0x7f) << 14 |
+                  (st->data[8] & 0x7f) << 7 | (st->data[9] & 0x7f));
+    }
+    while (o + 4 <= t->size) {
+        unsigned spf, rate, ch;
+        unsigned n = hle_mp3_frame(st->data + o, &spf, &rate, &ch);
+
+        if (!n) {
+            o++;
+            continue;
+        }
+        if (st->nframes == cap) {
+            cap = cap ? cap * 2 : 8192;
+            st->frame_off = g_renew(uint32_t, st->frame_off, cap);
+        }
+        if (st->nframes == 0) {
+            st->spf = spf;
+            st->rate = rate;
+            st->channels = ch;
+            st->info_frame = n >= 48 &&
+                (memmem(st->data + o, MIN(n, 64u), "Xing", 4) ||
+                 memmem(st->data + o, MIN(n, 64u), "Info", 4));
+        }
+        st->frame_off[st->nframes++] = (uint32_t)o;
+        o += n;
+    }
+    return true;
+}
+
+/* Which file, and where in it, a piece of stream comes from. */
+static bool hle_stream_find(const uint8_t *head, size_t len, int *k_out,
+                            size_t *off_out)
+{
+    for (int i = 0; i < hle.ntracks; i++) {
+        /* The current track first: it is the likeliest, and the cheapest. */
+        int k = (hle.chosen >= 0) ? (hle.chosen + i) % hle.ntracks : i;
+        uint8_t *hit;
+
+        if (!hle_stream_load(k)) {
+            continue;
+        }
+        hit = memmem(hle_streams[k].data, hle.tracks[k].size, head, len);
+        if (hit) {
+            *k_out = k;
+            *off_out = hit - hle_streams[k].data;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The audio frame that starts at `off`, counting from the first one that
+ * carries audio; -1 if the file has no index or `off` is not a frame. */
+static long hle_stream_frame(int k, size_t off)
+{
+    HLEStream *st = &hle_streams[k];
+    unsigned lo = 0, hi = st->nframes;
+
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (st->frame_off[mid] < off) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= st->nframes || st->frame_off[lo] != off) {
+        return -1;
+    }
+    return (long)lo - (st->info_frame ? 1 : 0);
+}
+
+/*
+ * The guest handed its audio engine a piece of stream: follow it. A different
+ * file is a track change; a distant position in the same file is a seek or a
+ * restart. Only the host feed (ipod_classic_hle_audio_fill_dma) needs the
+ * position -- when the engine takes its PCM frame by frame the guest's own
+ * pipeline carries the timing.
  */
 void ipod_classic_hle_audio_note_stream(const uint8_t *head, size_t len)
 {
-    static uint8_t *data[HLE_MAX_TRACKS];
-    int fd = -1;
+    size_t off;
+    long frame;
+    double frac;
+    bool same;
+    int k;
 
     if (!hle.enabled || !qatomic_read(&hle.scan_done) || len < 32) {
         return;
     }
-    for (int i = 0; i < hle.ntracks; i++) {
-        /* The current track first: it is the likeliest, and the cheapest. */
-        int k = (hle.chosen >= 0) ? (hle.chosen + i) % hle.ntracks : i;
-        HLETrack *t = &hle.tracks[k];
-        uint8_t *hit;
-
-        if (!data[k]) {
-            if (fd < 0) {
-                fd = open(hle.disk_path, O_RDONLY);
-                if (fd < 0) {
-                    return;
-                }
-            }
-            data[k] = g_malloc(t->size);
-            if (pread(fd, data[k], t->size, t->file_off) != (ssize_t)t->size) {
-                g_free(data[k]);
-                data[k] = NULL;
-                continue;
-            }
+    if (!hle_stream_find(head, len, &k, &off)) {
+        if (hle.trace) {
+            fprintf(stderr, "HLE_AUDIO: stream NOT on disk: %02x %02x %02x %02x "
+                    "%02x %02x %02x %02x\n", head[0], head[1], head[2],
+                    head[3], head[4], head[5], head[6], head[7]);
         }
-        hit = memmem(data[k], t->size, head, len);
-        if (hit) {
-            double frac = (double)(hit - data[k]) / (double)t->size;
-            bool same;
+        return;
+    }
 
-            qemu_mutex_lock(&hle.lock);
-            hle.stream_seen = true;
-            hle.stream_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            same = (k == hle.chosen);
-            if (same && qatomic_read(&hle.pcm_ready)) {
-                size_t want = (size_t)(frac * (double)hle.pcm_len) & ~(size_t)3;
-                size_t have = hle.pcm_cursor;
-                if ((want > have ? want - have : have - want)
-                        > HLE_STREAM_SEEK_BYTES) {
-                    hle.pcm_cursor = want;
-                }
-            } else if (same) {
-                hle.start_frac = frac;      /* decode in flight: start there */
-            }
-            qemu_mutex_unlock(&hle.lock);
-            if (!same) {
-                hle_request_decode(k);
-                qemu_mutex_lock(&hle.lock);
-                hle.start_frac = frac;
-                qemu_mutex_unlock(&hle.lock);
-            }
-            if (hle.trace) {
-                fprintf(stderr, "HLE_AUDIO: stream is file%d at byte %td of "
-                        "%llu (%.1f%%)%s\n", k, hit - data[k],
-                        (unsigned long long)t->size, frac * 100.0,
-                        same ? "" : " -- track change");
-            }
-            break;
+    /*
+     * Where that is in the decoded track, as a fraction. By frame number when
+     * there is an index: MEASURED on a VBR file the byte offset put the
+     * position seconds out, and the seek test below then jumped the audio.
+     * The host feed's PCM has had ffmpeg's 1105 priming samples trimmed when
+     * the file carries an info frame.
+     */
+    frame = hle_stream_frame(k, off);
+    if (frame >= 0 && hle_streams[k].nframes > 1) {
+        HLEStream *st = &hle_streams[k];
+        double total = (double)(st->nframes - (st->info_frame ? 1 : 0)) *
+                       st->spf;
+        double at = (double)frame * st->spf -
+                    (st->info_frame && !hle_native ? 1105.0 : 0.0);
+        frac = at > 0 ? at / total : 0.0;
+    } else {
+        frac = (double)off / (double)hle.tracks[k].size;
+    }
+
+    qemu_mutex_lock(&hle.lock);
+    hle.stream_seen = true;
+    hle.stream_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    same = (k == hle.chosen);
+    if (same && qatomic_read(&hle.pcm_ready)) {
+        size_t want = (size_t)(frac * (double)hle.pcm_len) & ~(size_t)3;
+        size_t have = hle.pcm_cursor;
+        if ((want > have ? want - have : have - want) > HLE_STREAM_SEEK_BYTES) {
+            hle.pcm_cursor = want;
         }
+    } else if (same) {
+        hle.start_frac = frac;          /* decode in flight: start there */
     }
-    if (fd >= 0) {
-        close(fd);
+    qemu_mutex_unlock(&hle.lock);
+    if (!same) {
+        hle_request_decode(k);
+        qemu_mutex_lock(&hle.lock);
+        hle.start_frac = frac;
+        qemu_mutex_unlock(&hle.lock);
     }
+    if (hle.trace) {
+        fprintf(stderr, "HLE_AUDIO: t=%" PRId64 "ms stream is file%d at byte "
+                "%zu of %llu (frame %ld, %.1f%%)%s\n",
+                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), k, off,
+                (unsigned long long)hle.tracks[k].size, frame, frac * 100.0,
+                same ? "" : " -- track change");
+    }
+}
+
+/*
+ * The decoded audio of the frame the guest just handed its engine, in the
+ * file's own format: `spf * channels` 16-bit samples. This is what lets the
+ * engine model behave as a decoder -- frame in, that frame's PCM out -- so the
+ * guest's own pipeline carries the music, through its EQ and volume, with its
+ * own timing.
+ *
+ * Returns the bytes written; 0 when the frame is known but its track is still
+ * being decoded (the caller may wait a moment); -1 when it is not a frame of
+ * any file on the disk.
+ */
+int ipod_classic_hle_audio_frame_pcm(const uint8_t *head, size_t len,
+                                     uint8_t *dst, size_t max)
+{
+    HLEStream *st;
+    size_t off, bytes, at, n = 0;
+    long frame;
+    int k;
+
+    if (!hle.enabled || !hle_native || !qatomic_read(&hle.scan_done) ||
+        !hle_stream_find(head, len, &k, &off)) {
+        return -1;
+    }
+    frame = hle_stream_frame(k, off);
+    st = &hle_streams[k];
+    if (frame < 0) {
+        /* The info frame, or not on a frame boundary: silence is right for
+         * the first and the honest answer for the second. */
+        bytes = MIN(max, (size_t)(st->spf ? st->spf : 1152) *
+                         (st->channels ? st->channels : 2) * 2);
+        memset(dst, 0, bytes);
+        return (int)bytes;
+    }
+    bytes = MIN(max, (size_t)st->spf * st->channels * 2);
+    at = (size_t)frame * st->spf * st->channels * 2;
+
+    qemu_mutex_lock(&hle.lock);
+    if (k != hle.chosen || !qatomic_read(&hle.pcm_ready)) {
+        qemu_mutex_unlock(&hle.lock);
+        return 0;
+    }
+    if (at < hle.pcm_len) {
+        n = MIN(bytes, hle.pcm_len - at);
+        memcpy(dst, hle.pcm + at, n);
+    }
+    qemu_mutex_unlock(&hle.lock);
+    memset(dst + n, 0, bytes - n);
+    return (int)bytes;
 }
 
 /* ---------------------------------------------------------------- init ----- */
@@ -1124,6 +1362,8 @@ void ipod_classic_hle_audio_init(ARMCPU *cpu, PL080State *dmac0,
     memset(&hle, 0, sizeof(hle));
     hle.enabled = true;
     hle.trace = hle_env_on("HLE_AUDIO_TRACE");
+    hle.trace_disk = getenv("HLE_AUDIO_TRACE") &&
+                     atoi(getenv("HLE_AUDIO_TRACE")) >= 2;
     hle.sustain = hle_env_on("HLE_AUDIO_SUSTAIN");
     hle.cpu = cpu;
     hle.dmac0 = dmac0;
