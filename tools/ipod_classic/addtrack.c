@@ -1,7 +1,11 @@
 /*
  * Build an iPod music library on a mounted FAT32 image.
  *
- *   addtrack <mountpoint> <model> <file.mp3> [<file.mp3> ...]
+ *   addtrack <mountpoint> <model> <track> [<track> ...]
+ *
+ * A <track> is either a bare path (the filename becomes the title, as the
+ * first tests did) or "path|title|artist|album|track_nr|length_ms", which is
+ * what mkmusic.sh passes after asking ffprobe.
  *
  * itdb_init_ipod() lays out iPod_Control and writes the device files; each
  * track is copied in and added to the master playlist; itdb_write() emits
@@ -10,6 +14,7 @@
 
 #include <gpod/itdb.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static char *tag(const char *path, const char *what)
@@ -52,23 +57,33 @@ int main(int argc, char **argv)
 
     for (i = 3; i < argc; i++) {
         Itdb_Track *t = itdb_track_new();
+        gchar **f = g_strsplit(argv[i], "|", 6);
+        const char *path = f[0];
 
-        t->title      = tag(argv[i], "title");
-        t->artist     = g_strdup("Linkin Park");
-        t->album      = g_strdup("Collision Course");
+        if (g_strv_length(f) == 6) {
+            t->title    = g_strdup(f[1]);
+            t->artist   = g_strdup(f[2]);
+            t->album    = g_strdup(f[3]);
+            t->track_nr = atoi(f[4]);
+            t->tracklen = atoi(f[5]);
+        } else {
+            t->title    = tag(path, "title");
+            t->artist   = g_strdup("Linkin Park");
+            t->album    = g_strdup("Collision Course");
+            t->tracklen = 200000;        /* ms; only affects the progress bar */
+        }
         t->filetype   = g_strdup("MPEG audio file");
         t->mediatype  = ITDB_MEDIATYPE_AUDIO;
-        t->tracklen   = 200000;          /* ms; only affects the progress bar */
         t->size       = 0;
 
         itdb_track_add(db, t, -1);
         itdb_playlist_add_track(mpl, t, -1);
 
-        if (!itdb_cp_track_to_ipod(t, argv[i], &err)) {
-            fprintf(stderr, "copy %s: %s\n", argv[i], err ? err->message : "?");
+        if (!itdb_cp_track_to_ipod(t, path, &err)) {
+            fprintf(stderr, "copy %s: %s\n", path, err ? err->message : "?");
             return 1;
         }
-        printf("added %s -> %s\n", argv[i], t->ipod_path);
+        printf("added %s -> %s\n", path, t->ipod_path);
     }
 
     if (!itdb_write(db, &err)) {
