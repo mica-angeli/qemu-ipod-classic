@@ -83,6 +83,8 @@
  */
 static bool sm1_decode_on(void);
 
+static bool sm1_sync_on(void);
+
 static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
 {
     for (int idx = 0; idx < S5L8702_SM1_POS_CHANS; idx++) {
@@ -90,6 +92,40 @@ static bool sm1_pos_reg(IPodClassicSM1State *s, hwaddr offset, uint32_t *out)
         hwaddr a44 = S5L8702_SM1_POS_A44 + idx * S5L8702_SM1_POS_STRIDE;
         if (offset != a48 && offset != a44) {
             continue;
+        }
+        /*
+         * NOT A POSITION: A WINDOW (SM1_SYNC answers it as one).
+         *
+         * Everything below treats this pair as the engine's playback
+         * position, which is what it looked like from 1.1.2: "dest =
+         * 0x22020000 + position". Read in the 2.0.5 image it is the window
+         * through which the CPU reaches the engine's own memory:
+         *
+         *  - 0x080ab6d0 returns { [channel +4] + [+0xa48], [+0xa44] }.
+         *  - 0x080cd0f0 uses that as a start and a LENGTH: "is this address
+         *    inside [start, start + length)?", three tries, and it decides
+         *    whether a chain is handed over as an offset (|2) or an address
+         *    (|1). With a length of 0 it is always an address, which is what
+         *    the hand-over hook in this file decodes.
+         *  - 0x0802e5ec is the only other caller and it is an UPLOAD: it
+         *    copies data to "[descriptor +0xc] + start", narrowing words to
+         *    halfwords, in 8 or 16 KiB pages that 0x0802e710 splits at the
+         *    boundaries. Six calls at boot, 64 KiB of it in four 16 KiB
+         *    chunks; more at a track change.
+         *
+         * [channel +4] is IRAM1's base, so that memory is IRAM1 and a correct
+         * start is simply 0. Answered with a running position, every upload
+         * after boot -- when the I2S has started and the "position" is no
+         * longer 0 -- landed up to 32 KiB away from where it belonged, on
+         * whatever lives there, and sometimes off the end. MEASURED on 2.0.5:
+         * a data abort at 0x0802e6b0 (the narrowing store) with DFAR =
+         * 0x22041a16, at the first next-track press, caught by RepriseOS's
+         * panic handler. That is the fault IRAMSPILL was mapping RAM under,
+         * and the halfword copy of wiki/19 s11.26.
+         */
+        if (sm1_sync_on()) {
+            *out = 0;
+            return true;
         }
         /* Position in stereo frames. When the data-path HLE owns playback, use
          * ITS cursor so pause (frozen), seek (jumped) and track-change (reset)
