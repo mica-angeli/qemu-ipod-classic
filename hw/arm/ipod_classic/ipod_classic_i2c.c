@@ -41,6 +41,46 @@ static void ipod_classic_i2c_byte_done(void *opaque)
     ipod_classic_i2c_update_irq(s);
 }
 
+/*
+ * I2CTRACE=1: every START, with the 7-bit address, the direction and whether
+ * anything answered. Which chips a firmware talks to is the first thing to
+ * know about a board, and a slave that is not modelled shows up here as a NACK
+ * rather than as silence.
+ */
+static void i2c_trace_start(IPodClassicI2CState *s, bool recv, int nack)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("I2CTRACE") != NULL;
+    }
+    if (on) {
+        fprintf(stderr, "I2C %s 0x%02x %s%s\n", recv ? "rd" : "wr",
+                (unsigned)(s->iicds & 0xff) >> 1, nack ? "NACK" : "ack",
+                s->xfer_open ? "  (repeated start)" : "");
+    }
+}
+
+/* I2CTRACE=2 adds every data byte, and the STOPs. */
+static bool i2c_trace_bytes_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("I2CTRACE");
+        on = e && atoi(e) >= 2;
+    }
+    return on;
+}
+
+static void i2c_trace_byte(IPodClassicI2CState *s, bool recv, uint8_t v)
+{
+    if (i2c_trace_bytes_on()) {
+        fprintf(stderr, "I2C   %s %02x%s\n", recv ? "<-" : "->", v,
+                s->xfer_open ? "" : "  (NO TRANSFER OPEN)");
+    }
+}
+
 static void ipod_classic_i2c_set_lrb(IPodClassicI2CState *s, int nack)
 {
     if (nack) {
@@ -59,11 +99,13 @@ static void ipod_classic_i2c_go(IPodClassicI2CState *s)
 
     switch (mode) {
     case S5L8702_IICSTAT_START_TX:
+        i2c_trace_byte(s, false, s->iicds & 0xff);
         ipod_classic_i2c_set_lrb(s, i2c_send(s->bus, s->iicds & 0xff));
         ipod_classic_i2c_start_byte(s);
         break;
     case S5L8702_IICSTAT_START_RX:
         s->iicds = i2c_recv(s->bus);
+        i2c_trace_byte(s, true, s->iicds & 0xff);
         /*
          * ACK_GEN clear means "do not acknowledge this one", which is how both
          * drivers mark the last byte of a read: Apple's handler drops the bit
@@ -121,6 +163,59 @@ static uint64_t ipod_classic_i2c_read(void *opaque, hwaddr offset,
     }
 }
 
+/*
+ * CLOSING A TRANSFER, and why it needs its own flag.
+ *
+ * This used to be "if (iicstat & BUSY) i2c_end_transfer()" in the STOP cases
+ * below. BUSY is bit 5 of IICSTAT, bit 5 is inside the mode field the guest
+ * has just written, and a STOP is exactly the write that clears it (0xd0 and
+ * 0x90 against 0xf0 and 0xb0 for a START) -- so the test was never true and no
+ * transfer was ever ended.
+ *
+ * That matters more than it sounds, because QEMU's I2C core treats a START on
+ * a bus that still has a transfer open as a REPEATED start to the same slave
+ * and does not look at the address. MEASURED with I2CTRACE=1 on firmware
+ * 2.0.5: from the first PMU access of the boot onwards, every transaction was
+ * delivered to the PMU, whatever it was addressed to --
+ *
+ *     I2C wr 0x4a ack        74 at boot, the codec's whole bring-up
+ *     I2C wr 0x39 ack        17, to an address with no model behind it at all
+ *
+ * and the codec model next door, written precisely so that those writes would
+ * stop being NACKed, never received one byte (CODECTRACE=1: 0 register writes
+ * in a run that started playback and moved the volume). The codec's registers
+ * were being written into the PMU's instead.
+ *
+ * A real repeated START does re-address the bus, so one to a DIFFERENT slave
+ * closes the transfer here first; to the same slave it is left open, which is
+ * the register-pointer-then-read idiom both chips rely on.
+ */
+static void ipod_classic_i2c_close(IPodClassicI2CState *s)
+{
+    if (s->xfer_open) {
+        if (i2c_trace_bytes_on()) {
+            fprintf(stderr, "I2C   stop\n");
+        }
+        i2c_end_transfer(s->bus);
+        s->xfer_open = false;
+    }
+}
+
+static int ipod_classic_i2c_open(IPodClassicI2CState *s, bool recv)
+{
+    uint8_t addr = (s->iicds & 0xff) >> 1;
+    int nack;
+
+    if (s->xfer_open && s->xfer_addr != addr) {
+        ipod_classic_i2c_close(s);
+    }
+    nack = recv ? i2c_start_recv(s->bus, addr) : i2c_start_send(s->bus, addr);
+    i2c_trace_start(s, recv, nack);
+    s->xfer_open = !nack;
+    s->xfer_addr = addr;
+    return nack;
+}
+
 static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
                                    uint64_t value, unsigned size)
 {
@@ -145,34 +240,28 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
 
         if (!(value & S5L8702_IICSTAT_SOE)) {
             /* Serial output off: whatever was going on is over. */
-            if (s->iicstat & S5L8702_IICSTAT_BUSY) {
-                i2c_end_transfer(s->bus);
-                s->iicstat &= ~S5L8702_IICSTAT_BUSY;
-            }
+            ipod_classic_i2c_close(s);
+            s->iicstat &= ~S5L8702_IICSTAT_BUSY;
             break;
         }
 
         switch (mode) {
         case S5L8702_IICSTAT_START_TX:
-            ipod_classic_i2c_set_lrb(s,
-                i2c_start_send(s->bus, (s->iicds & 0xff) >> 1));
+            ipod_classic_i2c_set_lrb(s, ipod_classic_i2c_open(s, false));
             s->iicstat |= S5L8702_IICSTAT_BUSY;
             s->in_address = true;
             ipod_classic_i2c_start_byte(s);
             break;
         case S5L8702_IICSTAT_START_RX:
-            ipod_classic_i2c_set_lrb(s,
-                i2c_start_recv(s->bus, (s->iicds & 0xff) >> 1));
+            ipod_classic_i2c_set_lrb(s, ipod_classic_i2c_open(s, true));
             s->iicstat |= S5L8702_IICSTAT_BUSY;
             s->in_address = true;
             ipod_classic_i2c_start_byte(s);
             break;
         case S5L8702_IICSTAT_STOP_TX:
         case S5L8702_IICSTAT_STOP_RX:
-            if (s->iicstat & S5L8702_IICSTAT_BUSY) {
-                i2c_end_transfer(s->bus);
-                s->iicstat &= ~S5L8702_IICSTAT_BUSY;
-            }
+            ipod_classic_i2c_close(s);
+            s->iicstat &= ~S5L8702_IICSTAT_BUSY;
             s->byte_done = false;
             timer_del(s->byte_timer);
             s->iicstat2 |= S5L8702_IICSTAT2_STOP;
@@ -233,6 +322,7 @@ static void ipod_classic_i2c_reset(DeviceState *dev)
     s->byte_done = false;
     s->in_address = false;
     ipod_classic_i2c_update_irq(s);
+    ipod_classic_i2c_close(s);
 }
 
 static void ipod_classic_i2c_init(Object *obj)

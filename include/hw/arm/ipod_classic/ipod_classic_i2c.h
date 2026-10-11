@@ -132,6 +132,14 @@ struct IPodClassicI2CState {
     bool byte_done;
     /* Set between IICSTAT = 0xf0/0xb0 and the address byte completing. */
     bool in_address;
+
+    /*
+     * Whether a transfer is open on the QEMU bus, and to whom. NOT the BUSY
+     * bit of IICSTAT: the guest writes that bit itself, as part of the mode
+     * field, so by the time a STOP is being handled it already reads 0.
+     */
+    bool xfer_open;
+    uint8_t xfer_addr;
 };
 
 #endif
