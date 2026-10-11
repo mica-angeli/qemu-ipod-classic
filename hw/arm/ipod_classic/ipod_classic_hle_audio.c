@@ -64,6 +64,7 @@
 #include "qemu/log.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
+#include "qemu/timer.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-common.h"
 #include "hw/dma/pl080.h"
@@ -80,6 +81,25 @@
  * before playback navigation completes. Only used for the single-song fallback.
  */
 #define HLE_BOOT_TX_SAMPLES  (3u * 1000u * 1000u)
+
+/*
+ * How much of one file the guest must have read before the disk-read fallback
+ * takes it for the track being played. It was 8192, the size of one readahead,
+ * and MEASURED on a five-song disk that is how the mount-time scan -- a 32 KiB
+ * read that runs from the directory clusters into the head of the first file --
+ * got the first file on the disk "playing" from boot -- and since it repeats
+ * that same read, a bigger total alone does not stop it, so the head of each
+ * file is not counted at all. A track being streamed passes both in its first
+ * seconds; a scan never does.
+ */
+#define HLE_DISK_PICK_BYTES  (256u * 1024u)
+#define HLE_DISK_PICK_SKIP   (64u * 1024u)
+
+/* A stream position further than this from the PCM cursor is a seek. */
+#define HLE_STREAM_SEEK_BYTES  (5u * 44100u * 4u)
+
+/* No frame handed to the engine for this long means the guest is not playing. */
+#define HLE_STREAM_IDLE_NS  (400 * 1000 * 1000LL)
 
 /* The DMAC0 request line the I2S TX FIFO drives (mem->peri, flow 1). */
 #define HLE_IIS0_TX            0xA
@@ -127,6 +147,9 @@ typedef struct {
     uint8_t    *pcm;                /* malloc'd, owned by the shim             */
     size_t      pcm_len;            /* bytes                                   */
     size_t      pcm_cursor;         /* bytes already fed                       */
+    double      start_frac;         /* where in the track a decode starts, 0..1 */
+    bool        stream_seen;        /* the engine has been handed a stream     */
+    int64_t     stream_ns;          /* virtual time of the last such hand-over */
     int         pcm_ready;          /* qatomic: 1 once pcm is decoded          */
 
     bool        filled;             /* fill_dma staged a burst; commit pending  */
@@ -558,6 +581,7 @@ static void hle_request_decode(int k)
     hle.req_track = k;
     hle.decode_gen++;
     hle.pcm_cursor = 0;
+    hle.start_frac = 0.0;
     hle.paused = false;
     qatomic_set(&hle.pcm_ready, 0);
     qemu_cond_signal(&hle.cond);
@@ -599,7 +623,7 @@ static void *hle_worker(void *arg)
             g_free(hle.pcm);
             hle.pcm = pcm;
             hle.pcm_len = used;
-            hle.pcm_cursor = 0;
+            hle.pcm_cursor = (size_t)(hle.start_frac * (double)used) & ~(size_t)3;
             hle.decoded_gen = gen;
             qatomic_set(&hle.pcm_ready, 1);
             qemu_mutex_unlock(&hle.lock);
@@ -637,14 +661,33 @@ void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len)
     if (!hle.enabled || !qatomic_read(&hle.scan_done)) {
         return;
     }
-    if (qatomic_read(&hle.pcm_ready) || hle.chosen >= 0) {
+    if (qatomic_read(&hle.pcm_ready) || hle.chosen >= 0 || hle.stream_seen) {
         return;
     }
 
+    /*
+     * Credit the read to the file it overlaps MOST, not to the one its first
+     * byte lands in. Files are packed back to back, so a readahead that opens
+     * a track starts in the tail cluster of the previous file: MEASURED on a
+     * five-song disk, the 32 KiB read that opened file1 began 2048 bytes
+     * before it, and keying on the start address played file0 instead.
+     */
+    int best = -1;
+    uint64_t best_ov = 0;
     for (int k = 0; k < hle.ntracks; k++) {
         HLETrack *t = &hle.tracks[k];
-        if (byte_off >= t->file_off && byte_off < t->file_off + t->size) {
-            hle.file_read[k] += len;
+        /* Past the head only: a scan re-reads the first clusters for ever. */
+        uint64_t lo = MAX(byte_off, t->file_off + HLE_DISK_PICK_SKIP);
+        uint64_t hi = MIN(byte_off + len, t->file_off + t->size);
+        if (hi > lo && hi - lo > best_ov) {
+            best_ov = hi - lo;
+            best = k;
+        }
+    }
+    for (int k = best; k >= 0 && k == best; k++) {
+        HLETrack *t = &hle.tracks[k];
+        {
+            hle.file_read[k] += best_ov;
             if (hle.trace) {
                 fprintf(stderr, "HLE_AUDIO: read file%d '%s' off=%llu len=%u "
                         "(tot=%llu)\n", k, t->name, (unsigned long long)byte_off,
@@ -652,7 +695,7 @@ void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len)
             }
             /* The guest is streaming this file's data -- the played track.
              * Low threshold: the MeCCA deadlock can cut the stream short. */
-            if (hle.file_read[k] >= 8192) {
+            if (hle.file_read[k] >= HLE_DISK_PICK_BYTES) {
                 hle_pick_track(k, byte_off, "file stream");
             }
             return;
@@ -880,6 +923,13 @@ const char *ipod_classic_hle_audio_track_album(void)
     return (hle.enabled && hle.cur_album[0]) ? hle.cur_album : "";
 }
 
+static bool hle_stream_idle(void)
+{
+    return hle.enabled && hle.stream_seen &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - hle.stream_ns
+               > HLE_STREAM_IDLE_NS;
+}
+
 void ipod_classic_hle_audio_fill_dma(void)
 {
     PL080State *s = hle.dmac0;
@@ -929,6 +979,19 @@ void ipod_classic_hle_audio_fill_dma(void)
         return;
     }
 
+    /*
+     * The guest feeds its engine one compressed frame at a time, in real time
+     * (MEASURED on 2.0.5: ~38 hand-overs a second while a track plays, none
+     * while it is paused). So when they stop, the guest has paused or stopped,
+     * and the host must stop too -- it has no other way to know, and used to
+     * play on under a paused Now Playing screen. Silence, cursor held.
+     */
+    if (hle_stream_idle()) {
+        static const uint8_t quiet[HLE_FILL_MAX_BYTES];
+        cpu_physical_memory_write(ch->src, quiet, bytes);
+        return;
+    }
+
     qemu_mutex_lock(&hle.lock);
     remaining = hle.pcm_len - hle.pcm_cursor;
     n = MIN((size_t)bytes, remaining);
@@ -965,6 +1028,86 @@ void ipod_classic_hle_audio_commit(uint32_t moved)
         hle.pcm_cursor = hle.pcm_len;
     }
     qemu_mutex_unlock(&hle.lock);
+}
+
+/*
+ * The guest handed its audio engine a buffer of compressed stream. Find those
+ * bytes on the disk: that names the file being played and the position in it,
+ * exactly, where the disk-read heuristic above can only guess (and guesses
+ * wrong whenever a readahead straddles two files). Follow it: a different file
+ * is a track change, a distant position in the same file is a seek or a
+ * restart.
+ *
+ * The position is turned into PCM by proportion, which is exact for constant
+ * bitrate and close for anything else; the guest's own elapsed-time display
+ * does not come from here, so the error is inaudible rather than visible.
+ */
+void ipod_classic_hle_audio_note_stream(const uint8_t *head, size_t len)
+{
+    static uint8_t *data[HLE_MAX_TRACKS];
+    int fd = -1;
+
+    if (!hle.enabled || !qatomic_read(&hle.scan_done) || len < 32) {
+        return;
+    }
+    for (int i = 0; i < hle.ntracks; i++) {
+        /* The current track first: it is the likeliest, and the cheapest. */
+        int k = (hle.chosen >= 0) ? (hle.chosen + i) % hle.ntracks : i;
+        HLETrack *t = &hle.tracks[k];
+        uint8_t *hit;
+
+        if (!data[k]) {
+            if (fd < 0) {
+                fd = open(hle.disk_path, O_RDONLY);
+                if (fd < 0) {
+                    return;
+                }
+            }
+            data[k] = g_malloc(t->size);
+            if (pread(fd, data[k], t->size, t->file_off) != (ssize_t)t->size) {
+                g_free(data[k]);
+                data[k] = NULL;
+                continue;
+            }
+        }
+        hit = memmem(data[k], t->size, head, len);
+        if (hit) {
+            double frac = (double)(hit - data[k]) / (double)t->size;
+            bool same;
+
+            qemu_mutex_lock(&hle.lock);
+            hle.stream_seen = true;
+            hle.stream_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            same = (k == hle.chosen);
+            if (same && qatomic_read(&hle.pcm_ready)) {
+                size_t want = (size_t)(frac * (double)hle.pcm_len) & ~(size_t)3;
+                size_t have = hle.pcm_cursor;
+                if ((want > have ? want - have : have - want)
+                        > HLE_STREAM_SEEK_BYTES) {
+                    hle.pcm_cursor = want;
+                }
+            } else if (same) {
+                hle.start_frac = frac;      /* decode in flight: start there */
+            }
+            qemu_mutex_unlock(&hle.lock);
+            if (!same) {
+                hle_request_decode(k);
+                qemu_mutex_lock(&hle.lock);
+                hle.start_frac = frac;
+                qemu_mutex_unlock(&hle.lock);
+            }
+            if (hle.trace) {
+                fprintf(stderr, "HLE_AUDIO: stream is file%d at byte %td of "
+                        "%llu (%.1f%%)%s\n", k, hit - data[k],
+                        (unsigned long long)t->size, frac * 100.0,
+                        same ? "" : " -- track change");
+            }
+            break;
+        }
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
 }
 
 /* ---------------------------------------------------------------- init ----- */

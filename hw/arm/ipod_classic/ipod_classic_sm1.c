@@ -462,7 +462,19 @@ static int sm1_publish_slots(IPodClassicSM1State *s)
     {
         static uint64_t freed;      /* one SM1 in the machine */
         static uint64_t base_pos;
-        uint64_t pos = sm1_stream_pos(s);
+        /*
+         * Always the I2S count, never sm1_stream_pos(): without SM1_DECODE that
+         * switches to the host shim's cursor the moment a song is decoded, the
+         * new value is far BELOW base_pos, and (pos - base_pos) wraps -- the
+         * loop below then "frees" 2^64 slots and never returns. MEASURED on
+         * 2.0.5: the main loop spun here for good.
+         */
+        uint64_t pos = s->i2s ? s->i2s->tx_samples / 2 : 0;
+
+        if (pos < base_pos) {
+            base_pos = pos;             /* the I2S was reset under us */
+            freed = 0;
+        }
 
         if (freed == 0) {
             /* Nothing played yet: the whole ring is the firmware's to fill. */
@@ -933,6 +945,27 @@ static void ipod_classic_sm1_write(void *opaque, hwaddr offset,
             }
         } else {
             s->irq_armed = false;
+        }
+        break;
+    case S5L8702_SM1_STREAM_CHAIN:
+        /*
+         * Sub-block 4 +0x00: the firmware hands the engine a descriptor chain
+         * whose buffer carries the compressed stream (wiki/19 s11.112):
+         *
+         *     value  = chain address | bit 0 (go)
+         *     chain  : +0 next, +4 flags/length, +8 buffer (uncached alias)
+         *
+         * Those bytes are the one exact statement of WHICH file the guest is
+         * playing and WHERE in it, so pass them to the host decoder instead of
+         * leaving it to guess from disk reads.
+         */
+        if (value & 1) {
+            uint32_t chain[3];
+            uint8_t head[64];
+
+            cpu_physical_memory_read(value & ~3u, chain, sizeof(chain));
+            cpu_physical_memory_read(le32_to_cpu(chain[2]), head, sizeof(head));
+            ipod_classic_hle_audio_note_stream(head, sizeof(head));
         }
         break;
     default:

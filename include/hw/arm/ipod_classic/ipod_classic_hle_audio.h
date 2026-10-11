@@ -79,6 +79,12 @@ bool ipod_classic_hle_audio_enabled(void);
 void ipod_classic_hle_audio_note_disk_read(uint64_t byte_off, uint32_t len);
 
 /*
+ * The guest handed its audio engine `len` bytes of compressed stream: identify
+ * the file and the position from them. A no-op unless the shim is enabled.
+ */
+void ipod_classic_hle_audio_note_stream(const uint8_t *head, size_t len);
+
+/*
  * True when the shim is enabled and actively feeding decoded PCM (a song has
  * been identified and decoded). The clock model uses this to suppress the
  * retailOS's deadlock-watchdog reboot while the HLE is playing the song --

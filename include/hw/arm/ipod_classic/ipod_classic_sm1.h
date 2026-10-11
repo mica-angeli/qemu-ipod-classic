@@ -71,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
  */
 #define S5L8702_SM1_IRQ_ASSERT_US  20
 
+#define S5L8702_SM1_STREAM_CHAIN 0x100   /* sub-block 4 +0x00: descriptor chain */
 #define S5L8702_SM1_INTEN       0xa8c
 #define S5L8702_SM1_INTEN_FRAME (1u << 2)
 
