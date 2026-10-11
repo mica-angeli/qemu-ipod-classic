@@ -241,6 +241,13 @@ typedef struct {
      */
     hwaddr reset_pc;
     char bootrom_path[1024];
+    /*
+     * Optional 0x120-byte SysInfo block to hand the OS instead of the three
+     * fields we synthesise. Firmware 2.0.x needs it: 0x082be27c (2.0.5) wants
+     * (hw_id >> 16) == 0x13 AND (hw_id & 0xffff) >= 0x300, so the 6G's
+     * 0x00130000 reboots it into "softupdt".
+     */
+    char sysinfo_path[1024];
 } IPodClassicMachineState;
 
 #endif
