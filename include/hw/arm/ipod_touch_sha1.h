@@ -34,6 +34,14 @@ typedef struct IPodTouchSHA1State {
     bool hash_computed;
     bool memory_fed;   /* message came in via memory mode, so it is unpadded */
     SHA_CTX ctx;
+
+    /*
+     * "block-engine": behave as the S5L8702 driver expects (see
+     * ipod_touch_sha1.c). Off by default, which leaves the iPod Touch
+     * machines exactly as they were.
+     */
+    bool block_engine;
+    uint32_t h[5];     /* the chaining state, readable AND writable */
 } IPodTouchSHA1State;
 
 #endif

@@ -904,6 +904,12 @@ static void ipod_classic_machine_init(MachineState *machine)
     create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
     if (!getenv("SHA1_OFF")) {
         dev = qdev_new("ipodtouch.sha1");
+        /*
+         * Apple's S5L8702 driver uses the block as a bare compression
+         * function and does its own padding, state saving and restoring; see
+         * the note in ipod_touch_sha1.c.
+         */
+        qdev_prop_set_bit(dev, "block-engine", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
                                             &IPOD_TOUCH_SHA1(dev)->iomem, 1);
