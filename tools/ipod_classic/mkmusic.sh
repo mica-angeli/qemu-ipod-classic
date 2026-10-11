@@ -3,7 +3,7 @@
 # mounting anything: libgpod writes iPod_Control into a plain directory and
 # mtools copies that into a fresh FAT32 image.
 #
-#   mkmusic.sh <out.img> <Firmware-XX> <sysinfo.bin> <file.mp3> [<file.mp3> ...]
+#   mkmusic.sh <out.img> <Firmware-XX> <sysinfo.bin> <file> [<file> ...]
 #
 # <sysinfo.bin> is the 0x120-byte SysInfo block of the device being emulated
 # (the one the machine takes as sysinfo=): its FireWire GUID and model number
@@ -42,7 +42,7 @@ for f in "$@"; do
     n=$((n + 1))
     ms=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f" \
          | awk '{printf "%d", $1 * 1000}')
-    title=$(tag "$f" title); [ -n "$title" ] || title=$(basename "$f" .mp3)
+    title=$(tag "$f" title); [ -n "$title" ] || title=$(basename "${f%.*}")
     trk=$(tag "$f" track | cut -d/ -f1); [ -n "$trk" ] || trk=$n
     printf '%s|%s|%s|%s|%s|%s\0' "$f" "$title" "$(tag "$f" artist)" \
         "$(tag "$f" album)" "$trk" "$ms"

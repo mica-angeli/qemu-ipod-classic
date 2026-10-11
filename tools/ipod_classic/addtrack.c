@@ -72,7 +72,10 @@ int main(int argc, char **argv)
             t->album    = g_strdup("Collision Course");
             t->tracklen = 200000;        /* ms; only affects the progress bar */
         }
-        t->filetype   = g_strdup("MPEG audio file");
+        /* What iTunes writes here; the extension is all we have to go on. */
+        t->filetype   = g_strdup(g_str_has_suffix(path, ".m4a") ||
+                                 g_str_has_suffix(path, ".M4A")
+                                 ? "AAC audio file" : "MPEG audio file");
         t->mediatype  = ITDB_MEDIATYPE_AUDIO;
         t->size       = 0;
 
