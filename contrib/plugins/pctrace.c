@@ -36,6 +36,8 @@
  *                   count-only by default
  *   loud=0xADDR     undo quiet for a PC (emit per-hit lines again)
  *   nodefault=on    do not install the built-in PC table (only pc=/trig= args)
+ *   period=MS       every MS of wall time, one line with each watched PC's hit
+ *                   count since the previous line (rates over time, not totals)
  *
  * REGISTER READ (8.2 backport of qemu_plugin_read_register -- see plugins/api.c):
  *   regpc=0xADDR:LABEL          at ADDR log LR + r0..r3 + sp of the guest, every
@@ -78,6 +80,7 @@ typedef struct {
     bool trigger;       /* opens the per-hit logging window */
     bool quiet;         /* count only, never emit a per-hit line (hot PCs) */
     guint64 count;      /* total times executed (all run) */
+    guint64 last;       /* count at the last period= line */
 } WatchPC;
 
 /* Built-in table. Addresses are VERIFIED runtime VAs from wiki/19 + task brief:
@@ -102,6 +105,8 @@ static gint64 t0;                   /* first-hit timestamp, for relative stamps 
 static bool always;                 /* log every hit, ignore window */
 static guint64 cap;                 /* per-PC line cap in always mode */
 static guint64 lines;               /* total lines emitted (global sanity cap) */
+static gint64 period_us;            /* period=MS: emit a rate line this often; 0 = off */
+static gint64 period_next;
 
 /*
  * RANGE TRACE (discovery mode). range=0xLO-0xHI logs the first-seen PC of every
@@ -233,6 +238,26 @@ static void vcpu_pc_exec(unsigned int cpu_index, void *udata)
         t0 = now;
     }
     w->count++;
+
+    /*
+     * period=MS: one line per period with how many times each watched PC ran
+     * since the previous line. A summary at exit cannot tell "40 a second all
+     * along" from "400 in the first second and then nothing", and that
+     * difference is the whole question when a pipeline stalls part-way.
+     */
+    if (period_us && now >= period_next) {
+        if (period_next) {
+            fprintf(out, "PCTRACE +%8" PRId64 "us PERIOD", now - t0);
+            for (guint i = 0; i < watch->len; i++) {
+                WatchPC *p = &g_array_index(watch, WatchPC, i);
+                fprintf(out, " %s=%" PRIu64, p->label, p->count - p->last);
+                p->last = p->count;
+            }
+            fprintf(out, "\n");
+            fflush(out);
+        }
+        period_next = now + period_us;
+    }
 
     if (w->trigger) {
         /* (re)open the logging window and announce the trigger itself */
@@ -569,6 +594,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             nodefault = kv[1] && !g_strcmp0(kv[1], "on");
         } else if (!g_strcmp0(kv[0], "window")) {
             window_us = g_ascii_strtoull(kv[1], NULL, 10) * 1000;
+        } else if (!g_strcmp0(kv[0], "period") && kv[1]) {
+            period_us = g_ascii_strtoull(kv[1], NULL, 10) * 1000;
         } else if (!g_strcmp0(kv[0], "always")) {
             always = kv[1] && !g_strcmp0(kv[1], "on");
         } else if (!g_strcmp0(kv[0], "cap")) {
