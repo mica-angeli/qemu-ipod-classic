@@ -135,9 +135,16 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
                 break;
             }
 
+            /*
+             * pc is only TB-accurate from an MMIO callback; lr and sp are
+             * exact, and lr is what identifies who asked for the reset.
+             */
             warn_report("S5L8702: guest asked for a software reset "
-                        "(SWRCON = 0x%" PRIx64 "), next image \"%s\" pc~0x%08x",
-                        value, tag, pc);
+                        "(SWRCON = 0x%" PRIx64 "), next image \"%s\" pc~0x%08x"
+                        " lr=0x%08x sp=0x%08x",
+                        value, tag, pc,
+                        cs ? ARM_CPU(cs)->env.regs[14] : 0,
+                        cs ? ARM_CPU(cs)->env.regs[13] : 0);
             s->reg[S5L8702_CLK_RSTSR / 4] |= S5L8702_RSTSR_SWR;
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }
