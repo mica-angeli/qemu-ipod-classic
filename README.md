@@ -6,7 +6,7 @@ devices**, with no boot ROM and without patching a single firmware instruction.
 
 | Machine | SoC | What it boots |
 |---|---|---|
-| **`iPod-Classic`** | Samsung S5L8702 | **Apple's retailOS**: RTXC kernel, disk, fonts, full clickwheel navigation, and **the music player — Now Playing screen and audio out of the guest's own I2S** |
+| **`iPod-Classic`** | Samsung S5L8702 | **Apple's retailOS**: RTXC kernel, disk, fonts, full clickwheel navigation, and **the music player — Now Playing screen and audio out of the guest's own I2S**. Firmware 1.1.2, and [2.0.5 / RepriseOS](#firmware-205-and-repriseos), where the player works in full |
 | **`iPod-Video`** | PortalPlayer PP5022C | **Rockbox** up to its menu, navigable, and **Apple's retailOS**: language screen → main menu → submenus → back |
 
 Neither machine emulates Apple's boot ROM. The *hardware* the firmware touches is
@@ -89,6 +89,10 @@ and switching tracks gives a burst and then silence. The MP3 decode itself is do
 host-side, the way an emulator handles an undocumented on-chip codec; everything else —
 track selection, transport, render pump, DMA, I2S — runs on the firmware.
 
+That paragraph is firmware 1.1.2 with the flags of its day. On firmware 2.0.5 all
+three work, and the audio is carried by the firmware end to end — see
+[Firmware 2.0.5 and RepriseOS](#firmware-205-and-repriseos).
+
 Full write-up: [`wiki/20-classic6g-reproductor.md`](wiki/20-classic6g-reproductor.md)
 (how it was fixed) and [`wiki/19-classic6g-dsp-hle.md`](wiki/19-classic6g-dsp-hle.md)
 (the investigation, including the ~16 hypotheses that had to be retracted).
@@ -137,6 +141,26 @@ sudo apt install -y libsdl2-dev libssl-dev libglib2.0-dev libpixman-1-dev \
 A cold build takes about **16 minutes**. A no-op `ninja` takes ~20 s warm, but can take
 **6 minutes** the first time after touching files from Windows — that is the 9p cache
 on `/mnt/c`, not a broken build.
+
+### macOS (Apple Silicon)
+
+```bash
+brew install glib ninja pixman pkg-config sdl2 openssl@3 ffmpeg dosfstools mtools libplist
+
+# QEMU 8.2's configure needs distlib and does not run on a recent Homebrew Python.
+python3.11 -m venv .cache/hostpy && .cache/hostpy/bin/pip install distlib setuptools wheel
+
+mkdir -p build && cd build
+../configure --python=$PWD/../.cache/hostpy/bin/python3 --enable-sdl \
+             --target-list=arm-softmmu --disable-capstone --disable-pie --disable-slirp \
+             --disable-werror \
+             --extra-cflags=-I/opt/homebrew/opt/openssl@3/include \
+             --extra-ldflags='-L/opt/homebrew/opt/openssl@3/lib -lcrypto'
+ninja qemu-system-arm
+```
+
+The binary is native; nothing here needs WSL. A cold build took about two minutes on
+an M-series Mac.
 
 ---
 
@@ -216,6 +240,98 @@ is its `addr` in the firmware directory.
 | `ATATRACE=1` | the whole ATA conversation, register by register |
 | `WHEELTRACE=1` | packets, commands and IRQ 23 edges |
 | `SM1TRACE=1`, `PMUTRACE=1`, `I2SCOUNT=1`, `DMATRACE=1` | the audio path, the PMU, the I2S and the DMA controllers |
+
+---
+
+## Firmware 2.0.5 and RepriseOS
+
+Apple's last Classic firmware, 2.0.5 (the 6.5G and 7G's, and what
+[RepriseOS](https://github.com/lgreitis/osos-lab) is built on), runs on the same machine.
+On it the player works in full, and the music is played by the firmware's own pipeline:
+
+![Songs, Now Playing a minute in, the volume bar, and paused](docs/screenshots/classic-2.0.5.png)
+
+Measured, not assumed:
+
+- **A whole track, sample for sample.** 243 of 243 seconds of a 4:04 MP3 at 0.0 dB and
+  correlation 1.00 against the decoded file, sample-identical after the first MPEG
+  frame — then on into the next track by itself, with 43 ms of silence at the boundary.
+- **Elapsed time, pause and resume, next and previous, seeking** with the wheel and by
+  holding next, and **tracks ending**: four 12 s clips play through and the player
+  returns to the song list.
+- **The iPod's own volume.** The wheel sets the codec's headphone amplifier, −60 dB to
+  +2 dB in 3 dB steps, and that is what you hear.
+- **MP3 and AAC** (.m4a). One compressed frame in, that frame's audio out.
+- **The real iTunesDB signature check.** A database signed for the device's FireWire GUID
+  is accepted; nothing is blanked and no digest is faked.
+- **Boot to the Language screen in about 7 s**, and a song starts within a second.
+
+What is still substituted is the decode itself: the on-chip codec is not emulated, so
+each frame the firmware hands the audio engine is answered with that frame's PCM from an
+`ffmpeg` decode of the same file. Everything around it — parsing the stream, timing,
+buffering, mixing down to the I2S, the UI — is Apple's code.
+
+### What you need
+
+- **An iPod Classic with RepriseOS installed.** Its disk holds `osos-cfw.bin` and
+  `cfw-loader.bin`, already decrypted, so this needs neither DFU nor the device's key —
+  just the iPod mounted as a disk. (Stock 2.0.5 has not been tried here: its `osos` has
+  to be decrypted on a device first.)
+- **`iPod_38.2.0.5.ipsw`**, for the firmware partition with the fonts.
+- For a disk with music on it: `ffmpeg`, `dosfstools`, `mtools`, `libplist`, and a built
+  [libgpod](https://github.com/fadingred/libgpod) source tree (`src/.libs/libgpod.a`).
+
+### Steps
+
+```sh
+# 1. The firmware, from the iPod's own disk. sysinfo.bin identifies the device:
+#    keep it out of anything you publish.
+python3 tools/ipod_classic/reprise_split.py \
+        /Volumes/IPOD/osos-cfw.bin /Volumes/IPOD/cfw-loader.bin assets/classic7g
+
+# 2. The firmware partition, out of the .ipsw (it is a zip).
+mkdir -p assets/ipsw-2.0.5 && unzip -o iPod_38.2.0.5.ipsw -d assets/ipsw-2.0.5
+
+# 3a. A disk with music, signed for this device...
+LIBGPOD=~/src/libgpod tools/ipod_classic/mkmusic.sh assets/disk/music-2.0.5.img \
+        assets/ipsw-2.0.5/Firmware-38.9.0.5 assets/classic7g/sysinfo.bin *.mp3 *.m4a
+
+# 3b. ...or an empty one.
+truncate -s 64M fat32.img && mkfs.vfat -F 32 -n IPOD fat32.img
+python3 tools/ipod_classic/mkdisk6g4k.py assets/disk/E-2.0.5.img \
+        assets/ipsw-2.0.5/Firmware-38.9.0.5 fat32.img
+
+# 4. Run it.
+DISK=assets/disk/music-2.0.5.img tools/ipod_classic/run7g.sh
+```
+
+`run7g.sh` documents the environment it sets. The one you are likely to touch is
+`AUDIOGAIN`: the iPod's factory volume is −32 dB at the headphone amplifier, which is
+right for earbuds and very quiet for a desk, so the launcher adds 20 dB of make-up gain.
+`AUDIOGAIN=0` is the true level; `AUDIOGAIN=line` is the fixed level of the dock line-out.
+
+### What 2.0.5 needed
+
+Each of these was a wall of its own, and several were not specific to 2.0.5 at all:
+
+| | Symptom | Cause |
+|---|---|---|
+| `sysinfo=` | reboots to `softupdt` within milliseconds | 2.0.5 wants a hardware id of `0x0013xxxx` with a low half ≥ `0x300`; the machine synthesised the 6G's `0x00130000`. Now takes a real device's SysInfo block |
+| ATA | every uncached track took **23 s** to start; boot took 33 s | the drive's interrupt was reported on `ATA_IRQ` bit 0 only; Apple's driver unmasks bit 2 after each non-data command and waits 7.7 s for it, three times |
+| I2C | the codec never received a byte; an absent chip "answered" | a STOP never ended the transfer, so every transaction after the first went to the PMU |
+| Audio engine | clock stuck at 0:00, resume skipped tracks | completions came off a 25 ms timer instead of answering each frame handed over; the firmware's output queue ran permanently empty (`SM1_SYNC`) |
+| Engine window | a data abort at the first track change | `+0xa48` is where the engine's memory starts, not a playback position; uploads were landing up to 32 KiB out |
+| SHA-1 | "No Music" unless the hash was blanked and the digest faked | the block is a bare compression function whose state the driver saves and restores; the model padded and finalised |
+| Codec | full scale whatever the volume bar said | the volume is the CS42L55's headphone gain, which was a plain register file |
+
+### Limits on 2.0.5
+
+- **The decode is host-side**, as above. HE-AAC and ALAC are not handled.
+- **SELECT is still dropped now and then** — 18 of 20 presses registered in a test, MENU
+  18 of 18.
+- **A guest crash looks like a freeze.** RepriseOS's panic handler paints its screen
+  straight to the panel, which the display model does not show.
+- **No USB**, as on 1.1.2.
 
 ---
 
@@ -307,7 +423,8 @@ Detail, including what is *not* modelled, in
 
 Listed because the value of this documentation is that it can be trusted.
 
-**iPod Classic 6G**
+**iPod Classic 6G** (firmware 1.1.2 — on 2.0.5 the first two no longer apply, see
+[Firmware 2.0.5 and RepriseOS](#firmware-205-and-repriseos))
 
 - **The player's elapsed time stays at 0:00.** Making the SM1 position register follow
   the I2S does not move it, so that counter comes from the player's own bookkeeping.
