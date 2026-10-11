@@ -43,12 +43,16 @@ DISK=${DISK:-assets/disk/E-2.0.5.img}
 #                     no further difference. AUDIOGAIN=0 is the true level,
 #                     AUDIOGAIN=line the fixed level of the dock line-out.
 #  DISP_ALPHA         composite the display layers front to back with alpha.
-#  SHA1_ZERO          the iTunesDB signature check (mkdisk6g4k.py blanks it).
 #
 # No longer needed on 2.0.5, each one having been a workaround for a model bug
 # since fixed: IRAMSPILL (the engine's window register), SM1_SLOTS/SM1_NSLOTS
-# (superseded by SM1_SYNC), HLE_AUDIO_SUSTAIN and PMUCHARGER.
-export SHA1_ZERO=1 DISP_ALPHA=1 \
+# (superseded by SM1_SYNC), HLE_AUDIO_SUSTAIN, PMUCHARGER, and SHA1_ZERO.
+#
+# About that last one: the iTunesDB signature is now checked for real, against
+# the FireWire GUID in sysinfo.bin. A disk from mkmusic.sh is signed for it. A
+# disk whose database had its hash blanked (mkdisk6g4k.py on its own, or an
+# older mkmusic.sh) shows "No Music" unless you run with SHA1_ZERO=1.
+export DISP_ALPHA=1 \
        SM1_IRQ=1 SM1_SYNC=1 SM1_DECODE=1 \
        HLE_AUDIO_DATAPATH=1 HLE_AUDIO_DISK="$DISK" \
        AUDIOPACE=1 AUDIOLIVE=1 AUDIOGAIN="${AUDIOGAIN-20}"
