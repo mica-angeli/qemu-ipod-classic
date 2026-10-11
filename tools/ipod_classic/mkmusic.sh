@@ -28,7 +28,12 @@ cc -o "$work/addtrack" "$here/addtrack.c" -I"$work/inc" "$L/src/.libs/libgpod.a"
     $(pkg-config --cflags --libs glib-2.0 gobject-2.0 gmodule-2.0 libplist-2.0) \
     -lsqlite3 -lxml2 -lz
 
-guid=$(dd if="$sysinfo" bs=1 skip=56 count=8 2>/dev/null | xxd -p | tr a-f A-F)
+# SysInfo holds the GUID little-endian; the SysInfo FILE wants it as written on
+# the label, most significant byte first (an Apple one starts 000A27).
+guid=$(dd if="$sysinfo" bs=1 skip=56 count=8 2>/dev/null | xxd -p |
+       sed 's/../&\n/g' | sed '/^$/d' | tail -r 2>/dev/null | tr -d '\n' | tr a-f A-F)
+[ ${#guid} = 16 ] || guid=$(dd if="$sysinfo" bs=1 skip=56 count=8 2>/dev/null |
+       xxd -p | sed 's/../&\n/g' | sed '/^$/d' | tac | tr -d '\n' | tr a-f A-F)
 model=$(dd if="$sysinfo" bs=1 skip=152 count=16 2>/dev/null | tr -d '\0')
 root=$work/root
 mkdir -p "$root/iPod_Control/Device"
@@ -52,4 +57,11 @@ fat=$work/fat32.img
 truncate -s "${FAT_MB:-256}M" "$fat"
 mkfs.vfat -F 32 -n IPOD "$fat" > /dev/null
 mcopy -s -i "$fat" "$root/iPod_Control" ::
-python3 "$here/mkdisk6g4k.py" "$out" "$fw" "$fat"
+# The database keeps the signature libgpod just wrote: it is for the GUID above,
+# which is the one the firmware will be given, so the real check passes.
+# BLANK_HASH58=1 blanks it instead, for a machine run with SHA1_ZERO=1.
+if [ -n "$BLANK_HASH58" ]; then
+    python3 "$here/mkdisk6g4k.py" "$out" "$fw" "$fat"
+else
+    KEEP_HASH58=1 python3 "$here/mkdisk6g4k.py" "$out" "$fw" "$fat"
+fi

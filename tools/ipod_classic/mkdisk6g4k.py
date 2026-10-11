@@ -96,7 +96,11 @@ def zero_itunesdb_hash58(fatb):
 
 
 fatb = mark_fat_volume(fatb)
-n_hash = zero_itunesdb_hash58(fatb)
+# KEEP_HASH58=1 leaves the signature libgpod wrote. That is the right thing
+# when the machine is given the device's own SysInfo (sysinfo=) and the SHA-1
+# engine is answering for real: the firmware then recomputes the same hash from
+# the same FireWire GUID, and the blanked one would be the mismatch.
+n_hash = 0 if os.environ.get('KEEP_HASH58') else zero_itunesdb_hash58(fatb)
 
 
 def pad(b):
