@@ -38,6 +38,7 @@
 #include "hw/core/cpu.h"
 #include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
+#include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
@@ -427,6 +428,22 @@ static void i2s_live_sample(IPodClassicI2SState *s, uint64_t value, unsigned siz
     }
     if (size > 4) {
         size = 4;
+    }
+    /*
+     * The codec's headphone amplifier. What comes down the I2S is the same
+     * whatever the volume is set to -- the firmware turns the wheel into two
+     * writes to the CS42L55 -- so this is where the volume bar becomes
+     * audible. Left and right alternate, and tx_samples has already counted
+     * this one. The WAV capture stays as clocked: it records the bus, not the
+     * jack.
+     */
+    if (size == 2) {
+        int32_t v = (int16_t)value;
+
+        v = (int32_t)(((int64_t)v *
+             ipod_classic_cs42l55_hp_gain_q15((int)((s->tx_samples - 1) & 1)))
+             >> 15);
+        value = (uint16_t)v;
     }
     for (unsigned i = 0; i < size; i++) {
         if (i2s_live_used() < sizeof(i2s_live.buf)) {
